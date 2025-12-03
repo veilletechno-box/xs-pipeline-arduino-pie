@@ -47,10 +47,10 @@ READ_TIMEOUT = 1.0
 RECONNECT_DELAY = 1.5
 PORT_SCAN_GLOBS = ["/dev/ttyACM*", "/dev/ttyUSB*"]
 
-API_URL = "https://example.com/validate"    # <-- REMPLACE PAR TON URL
-DEVICE_API_KEY = "REPLACE_WITH_DEVICE_KEY"  # <-- REMPLACE PAR TA CLEF
+API_URL = "https://hbuflidypffzxqkdhevu.supabase.co/functions/v1/validate-pin"    # <-- REMPLACE PAR TON URL
+DEVICE_API_KEY = "4e0332c9ce88c8727a6ec5e402bbfc8e281ab2c17f481bbd69f6b9791fde32a8"  # <-- REMPLACE PAR TA CLEF
 
-LOCKER_ID = "locker_01"       # identifiant du casier (modifiable)
+LOCKER_ID = "L001"       # identifiant du casier (modifiable)
 LOG_LEVEL = logging.INFO
 
 # Sécurité / robustesse client
