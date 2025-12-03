@@ -1,13 +1,30 @@
 #!/usr/bin/env python3
 """
-Refactor du script de lecture série / validation PIN.
+Raspberry Pi serial -> API gateway pour validation PIN.
 
-Principales améliorations :
-- structure en classes (SerialManager, PinValidator)
-- logging au lieu de prints
-- meilleure gestion des reconnections et des erreurs
-- typage et docstrings
+Ce script :
+- lit les messages JSON envoyés par l'Arduino via port série
+  attendus: {"event":"pin_entered","pin":"123456","seq":42,"crc32":12345678}
+- vérifie CRC + séquence (anti-replay)
+- envoie une requête POST sécurisée à l'API:
+    headers:
+      - x-device-key: <DEVICE_API_KEY>
+      - x-request-timestamp: <timestamp_ms>
+      - x-request-id: <uuid4>
+      - Content-Type: application/json
+- traite la réponse { "valid": true/false } et renvoie à l'Arduino:
+    {"event":"pin_result","valid":true,"seq":42}
+
+Sécurité côté client:
+- taille du body vérifiée (MAX_BODY_BYTES)
+- inclusion d'un Request-ID unique par requête
+- gestion de 429 + Retry-After, erreurs 5xx avec backoff
+- normalisation du time-to-respond côté client (MIN_RESPONSE_MS) pour atténuer
+  certaines fuites de timing — la protection principale doit rester côté serveur.
+
+Remplace API_URL et DEVICE_API_KEY par tes valeurs réelles.
 """
+
 from __future__ import annotations
 
 import glob
@@ -17,20 +34,32 @@ import os
 import signal
 import sys
 import time
+import uuid
 from typing import Iterable, Optional, Tuple
 
+import requests
 import serial
-from serial import SerialException, Serial
+from serial import Serial, SerialException
 
-# ---------- Configuration ----------
+# ---------------- CONFIG ----------------
 BAUD = 115200
 READ_TIMEOUT = 1.0
 RECONNECT_DELAY = 1.5
 PORT_SCAN_GLOBS = ["/dev/ttyACM*", "/dev/ttyUSB*"]
-ALLOWED_PINS = {"123456", "654321"}  # TODO: charger depuis DB/API si nécessaire
-LOG_LEVEL = logging.INFO
-# -----------------------------------
 
+API_URL = "https://example.com/validate"    # <-- REMPLACE PAR TON URL
+DEVICE_API_KEY = "REPLACE_WITH_DEVICE_KEY"  # <-- REMPLACE PAR TA CLEF
+
+LOCKER_ID = "locker_01"       # identifiant du casier (modifiable)
+LOG_LEVEL = logging.INFO
+
+# Sécurité / robustesse client
+REQUEST_TIMEOUT = 4.0        # timeout pour la requête HTTP (s)
+MAX_BODY_BYTES = 2048        # taille max autorisée du body JSON
+MIN_RESPONSE_MS = 200        # délai minimal de réponse (ms) pour normalisation côté client
+MAX_RETRIES_API = 2          # retries côté client pour erreurs transitoires (exclut 4xx non retriable)
+BACKOFF_BASE = 0.5           # backoff initial en secondes
+# ----------------------------------------
 
 # ---------- Logging ----------
 logger = logging.getLogger("pin_reader")
@@ -43,7 +72,6 @@ logger.addHandler(handler)
 
 # ---------- CRC helpers (même polynôme qu'Arduino) ----------
 def _crc32_update(crc: int, data_byte: int) -> int:
-    """Single-byte CRC-32 update using polynomial 0xEDB88320 (same as Arduino used)."""
     crc ^= data_byte
     for _ in range(8):
         crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)))
@@ -51,10 +79,6 @@ def _crc32_update(crc: int, data_byte: int) -> int:
 
 
 def crc32_pin_seq(pin: str, seq: int) -> int:
-    """
-    Compute CRC32 over pin bytes followed by 4 bytes of seq (little-endian),
-    starting from 0xFFFFFFFF and then invert - matching Arduino implementation.
-    """
     crc = 0xFFFFFFFF
     for ch in pin.encode("utf-8"):
         crc = _crc32_update(crc, ch)
@@ -66,7 +90,6 @@ def crc32_pin_seq(pin: str, seq: int) -> int:
 
 # ---------- Utilities ----------
 def find_serial_port(globs: Iterable[str] = PORT_SCAN_GLOBS) -> Optional[str]:
-    """Return first found candidate serial port (sorted), or None."""
     cands = []
     for patt in globs:
         cands.extend(glob.glob(patt))
@@ -75,7 +98,6 @@ def find_serial_port(globs: Iterable[str] = PORT_SCAN_GLOBS) -> Optional[str]:
 
 
 def make_result_json(valid: bool, seq: Optional[int] = None) -> bytes:
-    """Build compact JSON response and return encoded bytes with newline."""
     msg = {"event": "pin_result", "valid": bool(valid)}
     if seq is not None:
         try:
@@ -86,43 +108,161 @@ def make_result_json(valid: bool, seq: Optional[int] = None) -> bytes:
 # --------------------------------
 
 
-# ---------- Pin validation logic ----------
+# ---------- API client ----------
+class PinAPIClient:
+    """
+    Client sécurisé vers l'API.
+    Gère headers requis, taille du body, retries, et normalisation du temps de réponse.
+    """
+
+    def __init__(self, url: str, device_key: str, locker_id: str):
+        self.url = url
+        self.device_key = device_key
+        self.locker_id = locker_id
+        self.session = requests.Session()
+        # Headers statiques partiels (Content-Type et device key ajoutés à chaque requête
+        # mais on construit x-request-timestamp/x-request-id à la volée)
+        self.base_headers = {
+            "Content-Type": "application/json",
+            "x-device-key": self.device_key,
+            "User-Agent": "pin-rpi-client/1.0",
+        }
+
+    def _build_headers(self) -> dict:
+        """Construit headers dynamiques pour la requête."""
+        ts_ms = int(time.time() * 1000)
+        req_id = str(uuid.uuid4())
+        h = dict(self.base_headers)
+        h["x-request-timestamp"] = str(ts_ms)
+        h["x-request-id"] = req_id
+        return h
+
+    def validate_pin(self, pin: str) -> Tuple[bool, Optional[int]]:
+        """
+        Appelle l'API. Retourne (is_valid, http_status) — http_status utile pour debug.
+        - Respecte MAX_BODY_BYTES
+        - Gère 429 avec Retry-After si présent
+        - Retry pour erreurs transitoires (5xx, timeout, connection errors)
+        - Normalise le temps de réponse (MIN_RESPONSE_MS)
+        """
+        payload = {"pin_code": pin, "locker_id": self.locker_id}
+        body = json.dumps(payload, separators=(",", ":"))
+        body_bytes = body.encode("utf-8")
+        if len(body_bytes) > MAX_BODY_BYTES:
+            logger.error("[API] Body trop grand (%d bytes)", len(body_bytes))
+            return False, None
+
+        attempt = 0
+        while attempt <= MAX_RETRIES_API:
+            attempt += 1
+            headers = self._build_headers()
+            start = time.time()
+            try:
+                r = self.session.post(
+                    self.url,
+                    data=body_bytes,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                elapsed_ms = int((time.time() - start) * 1000)
+                # Normalisation: si trop rapide, on attend le reste pour éviter fuite timing
+                if elapsed_ms < MIN_RESPONSE_MS:
+                    to_wait = (MIN_RESPONSE_MS - elapsed_ms) / 1000.0
+                    logger.debug("[API] Normalisation timing: sleep %.03fs", to_wait)
+                    time.sleep(to_wait)
+
+                # Gestion des codes
+                if r.status_code == 200:
+                    # parse JSON
+                    try:
+                        data = r.json()
+                    except Exception:
+                        logger.error("[API] JSON invalide en réponse")
+                        return False, r.status_code
+
+                    if "valid" in data:
+                        return bool(data["valid"]), r.status_code
+
+                    # fallback structure
+                    if "success" in data and isinstance(data.get("data"), dict):
+                        if "valid" in data["data"]:
+                            return bool(data["data"]["valid"]), r.status_code
+
+                    logger.warning("[API] Réponse 200 mais structure inattendue: %s", data)
+                    return False, r.status_code
+
+                elif r.status_code in (401, 403):
+                    logger.error("[API] Auth échouée (status=%d). Vérifie DEVICE_API_KEY.", r.status_code)
+                    return False, r.status_code
+
+                elif r.status_code == 429:
+                    # Respecter Retry-After si fourni
+                    ra = r.headers.get("Retry-After")
+                    wait = None
+                    try:
+                        if ra is not None:
+                            wait = float(ra)
+                        else:
+                            wait = BACKOFF_BASE * (2 ** (attempt - 1))
+                    except Exception:
+                        wait = BACKOFF_BASE * (2 ** (attempt - 1))
+                    logger.warning("[API] 429 Rate-limited. Waiting %.2fs (attempt %d/%d)", wait, attempt, MAX_RETRIES_API + 1)
+                    time.sleep(wait)
+                    continue  # retry if attempts left
+
+                elif 500 <= r.status_code < 600:
+                    # erreur serveur -> backoff & retry
+                    wait = BACKOFF_BASE * (2 ** (attempt - 1))
+                    logger.warning("[API] Erreur serveur %d. Backoff %.2fs (attempt %d/%d)", r.status_code, wait, attempt, MAX_RETRIES_API + 1)
+                    time.sleep(wait)
+                    continue
+
+                else:
+                    logger.error("[API] Requête non attendue: status=%d body=%s", r.status_code, r.text[:200])
+                    return False, r.status_code
+
+            except requests.exceptions.RequestException as exc:
+                # Timeout / Connexion -> retry avec backoff
+                elapsed_ms = int((time.time() - start) * 1000)
+                if elapsed_ms < MIN_RESPONSE_MS:
+                    to_wait = (MIN_RESPONSE_MS - elapsed_ms) / 1000.0
+                    time.sleep(to_wait)
+                wait = BACKOFF_BASE * (2 ** (attempt - 1))
+                logger.warning("[API] Exception réseau: %s. Backoff %.2fs (attempt %d/%d)", exc, wait, attempt, MAX_RETRIES_API + 1)
+                time.sleep(wait)
+                continue
+
+        logger.error("[API] Échec après %d tentatives", MAX_RETRIES_API + 1)
+        return False, None
+# ------------------------------------
+
+
+# ---------- Pin validation logic (CRC + seq) ----------
 class PinValidator:
-    def __init__(self, allowed_pins: Iterable[str]):
-        self._allowed = set(allowed_pins)
-        # last_handled_seq prevents re-processing older sequences.
-        # initialize to -1 so seq == 0 is still processed.
+    def __init__(self):
         self.last_handled_seq: int = -1
 
-    def is_allowed(self, pin: str) -> bool:
-        return pin in self._allowed
-
     def should_process_seq(self, seq: Optional[int], recv_crc: Optional[int], pin: str) -> Tuple[bool, Optional[str]]:
-        """
-        Validate CRC and duplicate sequence.
-        Return (should_process, reason_if_not).
-        """
         if seq is None:
             return True, None
 
-        # compute CRC and compare
         calc = crc32_pin_seq(pin, seq)
+
+        # coerce
+        if recv_crc is not None and isinstance(recv_crc, str) and recv_crc.isdigit():
+            try:
+                recv_crc = int(recv_crc)
+            except Exception:
+                return False, "CRC non-intisable"
+
         if recv_crc is None:
             return False, f"CRC absent (calc={calc})"
         if not isinstance(recv_crc, int):
-            # try to coerce if it's a digit string
-            if isinstance(recv_crc, str) and recv_crc.isdigit():
-                try:
-                    recv_crc = int(recv_crc)
-                except Exception:
-                    return False, "CRC not intisable"
-            else:
-                return False, "CRC not int"
+            return False, "CRC non entier"
 
         if calc != recv_crc:
             return False, f"CRC invalide (recv={recv_crc}, calc={calc})"
 
-        # deduplication
         if seq <= self.last_handled_seq:
             return False, f"DUP seq={seq} <= last_handled={self.last_handled_seq}"
 
@@ -155,7 +295,6 @@ class SerialManager:
         self._closing = False
 
     def open_or_wait(self) -> Tuple[Serial, str]:
-        """Try to open the first found serial port, wait & retry until success."""
         while not self._closing:
             port = find_serial_port(self.port_globs)
             if not port:
@@ -166,7 +305,6 @@ class SerialManager:
             try:
                 logger.info("Connexion à %s ...", port)
                 ser = serial.Serial(port, self.baud, timeout=self.timeout)
-                # wait a bit for device ready (Arduino auto-reset)
                 time.sleep(2.0)
                 self.ser = ser
                 self.current_port = port
@@ -179,7 +317,6 @@ class SerialManager:
         raise RuntimeError("Fermeture demandée; abandon ouverture port")
 
     def safe_write(self, data: bytes) -> bool:
-        """Write bytes and flush; return True on success."""
         if not self.ser:
             logger.debug("safe_write: pas de port ouvert")
             return False
@@ -205,11 +342,11 @@ class SerialManager:
 
 # ---------- Main loop ----------
 def main_loop():
-    # ensure unbuffered logs for interactive runs
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
     serial_mgr = SerialManager()
-    validator = PinValidator(ALLOWED_PINS)
+    validator = PinValidator()
+    api_client = PinAPIClient(API_URL, DEVICE_API_KEY, LOCKER_ID)
 
     # handle Ctrl+C gracefully via signal
     def _signal_handler(signum, frame):
@@ -259,16 +396,14 @@ def main_loop():
                 # Do not respond to force Arduino retry when CRC is bad
                 continue
 
-            is_ok = validator.is_allowed(pin)
-            logger.info("PIN recu: %s -> %s%s",
-                        (pin or "<vide>"),
-                        "OK" if is_ok else "FAIL",
-                        f" | seq={seq}" if seq is not None else "")
+            logger.info("PIN recu: %s | seq=%s - Validation via API...", (pin or "<vide>"), seq)
 
-            # send response
+            is_ok, status = api_client.validate_pin(pin)
+            logger.info("API returned: %s (http=%s)", "OK" if is_ok else "FAIL", status)
+
+            # send response to Arduino
             payload = make_result_json(is_ok, seq)
             if not serial_mgr.safe_write(payload):
-                # if we failed to write, attempt to reconnect on next loop
                 logger.warning("Echec écriture de la réponse; tentative de reconnexion...")
                 try:
                     ser.close()
