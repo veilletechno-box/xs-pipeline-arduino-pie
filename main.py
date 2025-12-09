@@ -26,6 +26,7 @@ Remplace API_URL et DEVICE_API_KEY par tes valeurs réelles.
 """
 
 from __future__ import annotations
+from ai_camera.detect import  detect_frisbee_in_webcam_frame
 
 import glob
 import json
@@ -338,13 +339,15 @@ class SerialManager:
             self.ser = None
             logger.info("Port série fermé")
 # ----------------------------------
-
+SERIAL_MANAGER: Optional[SerialManager] = None
 
 # ---------- Main loop ----------
 def main_loop():
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
     serial_mgr = SerialManager()
+    global SERIAL_MANAGER
+    SERIAL_MANAGER = serial_mgr
     validator = PinValidator()
     api_client = PinAPIClient(API_URL, DEVICE_API_KEY, LOCKER_ID)
 
@@ -376,6 +379,12 @@ def main_loop():
                 continue
 
             event = data.get("event")
+
+            if event == "door_closed":
+                logger.info("Door closed event received.")
+                on_door_closed(data)
+                continue
+
             if event != "pin_entered":
                 logger.debug("Événement ignoré: %s", event)
                 continue
@@ -435,6 +444,62 @@ def main_loop():
             logger.exception("[WARN] Exception inattendue: %s", e)
             time.sleep(0.05)
 # ---------------------------------
+
+def on_door_closed(payload: dict) -> None:
+    """
+    Called when the Arduino notifies that the door is closed.
+
+    `payload` is the full JSON dict received from the Arduino.
+    You can later use it to access extra fields you might add,
+    like timestamps, locker_id, etc.
+    """
+    logger.info("[DOOR] Door closed event received: %s", payload)
+    frisbee_in_box = detect_frisbee_in_webcam_frame()
+
+    if not frisbee_in_box:
+        on_wrong_item()
+    else:
+        on_correct_item()
+
+def _send_item_result(is_correct: bool) -> None:
+    """
+    Envoie au microcontrôleur un message JSON indiquant si l'objet détecté
+    est correct ou non.
+
+    Message envoyé (une seule ligne terminée par '\n') :
+      {"event":"item_result","correct":true}
+    ou:
+      {"event":"item_result","correct":false}
+    """
+    if SERIAL_MANAGER is None:
+        logger.error("[ITEM] Impossible d'envoyer le résultat: SERIAL_MANAGER non initialisé")
+        return
+
+    msg = {
+        "event": "item_result",
+        "correct": bool(is_correct),
+    }
+    payload = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+
+    if not SERIAL_MANAGER.safe_write(payload):
+        logger.warning("[ITEM] Echec d'écriture série pour item_result")
+
+
+def on_wrong_item() -> None:
+    """
+    Appelé quand la caméra indique que l'objet est incorrect / absent.
+    """
+    logger.info("[ITEM] Mauvais objet détecté dans le casier")
+    _send_item_result(False)
+
+
+def on_correct_item() -> None:
+    """
+    Appelé quand la caméra indique que l'objet correct est présent.
+    """
+    logger.info("[ITEM] Objet correct détecté dans le casier")
+    _send_item_result(True)
+
 
 
 if __name__ == "__main__":
