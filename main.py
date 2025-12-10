@@ -70,6 +70,7 @@ handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
 logger.addHandler(handler)
 # --------------------------------
 
+is_item_available = True
 
 # ---------- CRC helpers (même polynôme qu'Arduino) ----------
 def _crc32_update(crc: int, data_byte: int) -> int:
@@ -454,6 +455,11 @@ def on_door_closed(payload: dict) -> None:
     like timestamps, locker_id, etc.
     """
     logger.info("[DOOR] Door closed event received: %s", payload)
+    global is_item_available
+    if is_item_available:
+        is_item_available = False
+        return
+
     frisbee_in_box = detect_frisbee_in_webcam_frame()
 
     if not frisbee_in_box:
@@ -499,6 +505,8 @@ def on_correct_item() -> None:
     """
     logger.info("[ITEM] Objet correct détecté dans le casier")
     _send_item_result(True)
+    global is_item_available
+    is_item_available = True
 
 
 
